@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from database import close_database, ping_database
-from routes import classrooms, schedules
+from routes import classrooms, documents, schedules
 from services.schedule_store import upsert_schedules
 from services.timetable_parser import parse_timetable_pdf
 
@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "IT Department Automation API"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 STARTED_AT = time.time()
 
 CORS_ORIGINS = [
@@ -88,6 +88,7 @@ app.add_middleware(
 
 app.include_router(schedules.router, prefix="/api/schedules")
 app.include_router(classrooms.router, prefix="/api/classrooms")
+app.include_router(documents.router, prefix="/api/documents")
 
 
 @app.get("/", include_in_schema=False)
@@ -98,6 +99,8 @@ async def root() -> dict[str, str]:
         "health": "/api/health",
         "schedules_debug": "/api/schedules/debug-parse",
         "classroom_check": "/api/classrooms/check",
+        "document_blueprints": "/api/documents/blueprints",
+        "document_generate": "/api/documents/generate",
     }
 
 

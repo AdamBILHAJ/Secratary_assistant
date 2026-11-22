@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 
 import { API_URL, type HealthResponse } from "@/lib/api";
 
+import WordAssistant from "./word-assistant";
+
 function formatUptime(seconds: number) {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
@@ -300,6 +302,8 @@ export default function Home() {
             </p>
           </Card>
         </div>
+
+        <WordAssistant />
 
         <section className="mt-10 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 className="text-sm font-semibold text-slate-200">Project layout</h2>

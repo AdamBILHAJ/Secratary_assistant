@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -123,6 +124,44 @@ async def fetch_occupancies(
             str(item.get("room") or ""),
             str(item.get("time_slot") or ""),
             str(item.get("class_name") or ""),
+        )
+    )
+    return documents
+
+
+async def fetch_class_schedules(
+    class_name: str, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Return stored schedule entries for one class, sorted for documents.
+
+    The query is read-only and matches the class name case-insensitively, so a
+    document can be enriched without mutating any stored schedule data.
+    """
+    normalized = (class_name or "").strip()
+    if not normalized:
+        return []
+
+    query = {
+        "class_name": {
+            "$regex": f"^{re.escape(normalized)}$",
+            "$options": "i",
+        }
+    }
+    try:
+        cursor = (
+            get_collection(SCHEDULES_COLLECTION)
+            .find(query, {"_id": 0, "imported_at": 0})
+            .limit(limit)
+        )
+        documents = await cursor.to_list(length=limit)
+    except (PyMongoError, RuntimeError) as exc:
+        raise ScheduleStoreError(f"MongoDB class schedule query failed: {exc}") from exc
+
+    documents.sort(
+        key=lambda item: (
+            str(item.get("day") or ""),
+            str(item.get("start_time") or item.get("time_slot") or ""),
+            str(item.get("subject") or ""),
         )
     )
     return documents

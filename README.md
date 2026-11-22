@@ -13,12 +13,15 @@ secratary_app/
 │   ├── database.py                # Async MongoDB Atlas client + ping
 │   ├── routes/
 │   │   ├── schedules.py           # PDF debug-parse + MongoDB sync
-│   │   └── classrooms.py          # Availability + AI recommendation
+│   │   ├── classrooms.py          # Availability + AI recommendation
+│   │   └── documents.py           # Word blueprints + .docx generation
 │   ├── services/
 │   │   ├── timetable_parser.py    # pdfplumber geometry-based parser
 │   │   ├── schedule_store.py      # Idempotent schedules collection upsert
 │   │   ├── classroom_availability.py
-│   │   └── gemini_service.py      # Gemini call + local fallback
+│   │   ├── doc_generator.py       # python-docx blueprint editing/building
+│   │   └── gemini_service.py      # Gemini calls + local fallbacks
+│   ├── blueprints/                # Custom uploaded .docx templates
 │   ├── requirements.txt
 │   ├── .env.example
 │   └── .env                       # local only, git-ignored
@@ -56,7 +59,7 @@ MONGODB_DB=it_automation
 MONGODB_TIMEOUT_MS=5000
 
 GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.8-flash
 GEMINI_TIMEOUT_SECONDS=20
 
 # Relative paths are resolved from the project root, backend/ and cwd.
@@ -82,7 +85,8 @@ LOG_LEVEL=INFO
 Create a key at <https://aistudio.google.com/apikey> and paste it into
 `GEMINI_API_KEY`. Never commit the real `.env` file. If the key is missing or
 Gemini is unreachable, `/api/classrooms/check` still returns a deterministic
-local recommendation with `"source": "fallback"`.
+local recommendation with `"source": "fallback"`, and Word generation uses a
+local document plan.
 
 ### Run the API
 
@@ -103,7 +107,7 @@ and canonical documentation use `/api/health`:
 {
   "status": "ok",
   "service": "IT Department Automation API",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "timestamp": "2026-11-15T16:00:00+00:00",
   "uptime_seconds": 12.4,
   "dependencies": {
@@ -325,7 +329,172 @@ the PDF text order:
 - returns warnings per page instead of failing the whole document when one page
   is malformed; a completely unparseable PDF returns `422`.
 
-## 3. Frontend setup
+## 3. Word document generation
+
+Part 3 adds Word-only document automation. Excel generation is intentionally
+not implemented yet: `doc_type: "excel"` returns `400`.
+
+Generation is prompt-driven. Gemini (`GEMINI_MODEL`, default
+`gemini-3.8-flash`) returns a structured routing decision:
+
+| Action | Result |
+| --- | --- |
+| `use_blueprint` | An allowlisted `.docx` is copied with no changes or an optional date update. |
+| `modify_blueprint` | Targeted edits are applied on a copy of an allowlisted `.docx`. |
+| `create_new` | A clean `.docx` is built from the enriched `new_doc` structure. |
+
+With no `blueprint_id` (or an empty string) the router is in **Auto mode**: it
+uses a blueprint only when the request clearly matches an allowlisted template.
+Phrases such as `from scratch`, `without blueprint`, `new document`, `sans
+modèle` or `nouveau document` always force `create_new`. Low-confidence or
+invalid blueprint selections are hard-gated to `create_new`, which is built
+from a complete `new_doc` payload: `title`, optional `subtitle`, `date_line`,
+`header_note`, `sections` (`heading`, `paragraphs`, `bullets`,
+`numbered_items`), `tables` (`title`, `headers`, `rows`), and an optional
+`signature_block`. Date/signature lines are only rendered when they are
+present in the payload, so unrelated documents never receive a forced
+`Radès, le ...` line. An explicit allowlisted `blueprint_id` still overrides
+Auto mode.
+
+Blueprints are restricted to an explicit allowlist: two bundled `Liste des
+Besoins` templates plus templates registered through the upload endpoint
+(`backend/blueprints/registry.json`). A blueprint reference outside that
+allowlist is rejected, and any route that points to a missing/non-allowlisted
+id is hard-gated to `create_new`. Templates are opened in memory, so originals
+are never modified.
+
+### 3.1 List allowlisted `.docx` blueprints
+
+```bash
+curl http://localhost:8000/api/documents/blueprints
+```
+
+```json
+{
+  "count": 2,
+  "allowlisted": true,
+  "blueprints": [
+    {
+      "id": "liste-besoins-2024",
+      "name": "Liste des Besoins 2024",
+      "filename": "Liste des Besoins 2024.docx",
+      "title": "Liste des Besoins 2024",
+      "description": "Modèle historique de liste des besoins ...",
+      "source": "builtin",
+      "location": "project_root",
+      "size_bytes": 48633,
+      "modified_at": "2026-11-14T19:55:01+00:00",
+      "structure": {
+        "headings": ["LISTE DES BESOINS"],
+        "tables": [
+          {
+            "index": 0,
+            "header": ["N°", "Désignation", "Quantité"],
+            "row_count": 6,
+            "column_count": 3,
+            "kind": "department_list"
+          }
+        ],
+        "paragraph_count": 12,
+        "table_count": 4
+      }
+    }
+  ],
+  "upload_directory": "backend/blueprints"
+}
+```
+
+### 3.2 Upload a custom blueprint
+
+Only `.docx` files are accepted; anything else returns `400`. Files are saved
+to `backend/blueprints/` and explicitly registered in the allowlist. Use
+`?overwrite=true` to replace an existing file with the same name; otherwise a
+numbered filename is chosen.
+
+```bash
+curl -X POST http://localhost:8000/api/documents/blueprints/upload \
+  -F "file=@/path/to/Custom Template.docx"
+```
+
+### 3.3 Generate a Word document
+
+Free-form prompt; the router chooses the mode automatically:
+
+```bash
+curl -X POST http://localhost:8000/api/documents/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "doc_type": "word",
+    "prompt": "Add 10 HDMI cables and remove scotch from the Liste des Besoins, date 22/11/2026",
+    "output_name": "Liste des Besoins - novembre 2026.docx"
+  }' \
+  --output "Liste des Besoins - novembre 2026.docx"
+```
+
+Force an allowlisted template with `blueprint_id`:
+
+```bash
+curl -X POST http://localhost:8000/api/documents/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Use this template and update the date to today.",
+    "blueprint_id": "liste-besoins-sept-2024"
+  }' \
+  --output "Liste des Besoins - aujourd hui.docx"
+```
+
+Standalone document, optionally enriched with stored schedules for a class:
+
+```bash
+curl -X POST http://localhost:8000/api/documents/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Prepare a clean timetable handout with a notes section.",
+    "target_class": "L1-TI-1"
+  }' \
+  --output "Emploi du temps L1-TI-1.docx"
+```
+
+The legacy fields `subject`, `instructions`, `blueprint_name` and `output_name`
+are still accepted. `blueprint_name` resolves only against the allowlist.
+`target_class` only triggers a read-only MongoDB `schedules` lookup — stored
+schedules are never modified.
+
+The response is a downloadable `.docx`:
+
+```text
+Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+Content-Disposition: attachment; filename="..."
+X-Doc-Action: modify_blueprint
+X-Blueprint-Used: liste-besoins-2024
+X-AI-Source: gemini | fallback
+X-AI-Model: gemini-2.5-flash-lite | fallback
+X-Applied-Edits: 3
+X-Doc-Summary: <percent-encoded UTF-8 summary>
+X-Doc-Explanation: <percent-encoded UTF-8 routing explanation>
+```
+
+**Error behaviour**
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Excel requested, invalid/empty upload, unreadable blueprint, or explicit non-allowlisted blueprint |
+| `404` | Explicit allowlisted blueprint file is missing |
+| `503` | MongoDB is unavailable for `target_class`, or the router failed |
+
+Without `GEMINI_API_KEY`, or if every Gemini attempt fails, routing and planning
+continue with a deterministic local fallback. The `X-AI-Source` response header
+reports `gemini` or `fallback`, and `X-AI-Model` reports the model that succeeded
+(or `fallback`). The `X-Doc-Summary` and `X-Doc-Explanation` headers are
+percent-encoded UTF-8 so the UI can show them safely.
+
+Routing tries `GEMINI_MODEL` first, then `GEMINI_FALLBACK_MODELS` (default:
+`gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash`).
+Each attempt uses `GEMINI_TIMEOUT_SECONDS` (default `30`); timeouts, `404`,
+`429` and `5xx` responses rotate to the next model within the overall
+`GEMINI_TOTAL_TIMEOUT_SECONDS` budget (default `75`).
+
+## 4. Frontend setup
 
 ```bash
 cd frontend
@@ -345,7 +514,11 @@ npm run dev
 ```
 
 Open <http://localhost:3000>; the dashboard shows the live API + Atlas status
-from `GET /api/health`.
+from `GET /api/health`, plus a **Word Document Assistant** section. Enter a
+free-form prompt, pick an optional allowlisted template override and optional
+`target_class`, then download the generated `.docx`. The interface intentionally
+does not display routing/mode badges; it only shows a concise summary and the
+download link.
 
 ## Notes
 
@@ -355,4 +528,11 @@ from `GET /api/health`.
 - **CORS:** add every frontend origin to `CORS_ORIGINS` (comma-separated).
 - **Secrets:** `.env` files are git-ignored; only `.env.example` is committed.
 - **MongoDB collections:** `schedules` is the only collection written in
-  Part 2. Each document is one course entry plus `imported_at`.
+  Part 2. Each document is one course entry plus `imported_at`. Part 3 only
+  reads schedules when `target_class` is supplied.
+- **Word blueprints:** bundled examples stay in the project root; custom
+  uploads are stored in `backend/blueprints/` and take resolution priority.
+  All usable templates must be in the explicit allowlist; routing never accepts
+  an invented blueprint id.
+- **Excel:** skipped in Part 3. `openpyxl` remains installed for future work,
+  but `doc_type: "excel"` returns `400`.
