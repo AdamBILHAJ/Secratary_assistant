@@ -19,6 +19,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from docx import Document
+from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
 from fastapi.testclient import TestClient
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -37,6 +40,21 @@ def _docx_text(content: bytes) -> str:
         for row in table.rows:
             parts.extend(cell.text for cell in row.cells)
     return "\n".join(parts)
+
+
+def _cell_fill(cell) -> str | None:
+    properties = cell._tc.tcPr
+    shading = properties.find(qn("w:shd")) if properties is not None else None
+    return shading.get(qn("w:fill")) if shading is not None else None
+
+
+def _cell_border(cell, edge: str = "top") -> str | None:
+    properties = cell._tc.tcPr
+    borders = properties.find(qn("w:tcBorders")) if properties is not None else None
+    if borders is None:
+        return None
+    element = borders.find(qn(f"w:{edge}"))
+    return element.get(qn("w:color")) if element is not None else None
 
 
 class WordRoutingTests(unittest.TestCase):
@@ -245,26 +263,234 @@ class WordRoutingTests(unittest.TestCase):
         }
         result = execute_word_decision(decision, prompt="Create a new report")
         document = Document(BytesIO(result["content"]))
+        text = _docx_text(result["content"])
         paragraphs = [paragraph.text for paragraph in document.paragraphs]
         styles = [paragraph.style.name for paragraph in document.paragraphs]
 
-        self.assertIn("Rapport annuel", paragraphs)
-        self.assertIn("Version préliminaire", paragraphs)
-        self.assertIn("Paris, le 22/11/2026", paragraphs)
-        self.assertIn("Note introductive", paragraphs)
-        self.assertIn("Synthèse", paragraphs)
-        self.assertIn("Point A", paragraphs)
-        self.assertIn("Étape 1", paragraphs)
-        self.assertIn("Tableau de suivi", paragraphs)
-        self.assertIn("Jean Dupont", paragraphs)
+        self.assertIn("Rapport annuel", text)
+        self.assertIn("Version préliminaire", text)
+        self.assertIn("Paris, le 22/11/2026", text)
+        self.assertIn("Note introductive", text)
+        self.assertIn("Synthèse", text)
+        self.assertIn("Point A", text)
+        self.assertIn("Étape 1", text)
+        self.assertIn("Tableau de suivi", text)
+        self.assertIn("Jean Dupont", text)
         self.assertIn("Heading 1", styles)
         self.assertIn("List Bullet", styles)
         self.assertIn("List Number", styles)
-        self.assertEqual(len(document.tables), 1)
+        # The legacy header_note becomes a callout table, followed by the data table.
+        self.assertEqual(len(document.tables), 2)
         self.assertEqual(
-            [cell.text for cell in document.tables[0].rows[0].cells],
+            [cell.text for cell in document.tables[1].rows[0].cells],
             ["Tâche", "Statut"],
         )
+
+    def test_09_design_spec_renders_custom_style_and_blocks(self) -> None:
+        spec = {
+            "font_name": "Aptos",
+            "base_font_size_pt": 12.5,
+            "margin_inches": 0.6,
+            "orientation": "landscape",
+            "primary_hex": "#123456",
+            "accent_hex": "#ABCDEF",
+            "callout_bg_hex": "#FFF0D0",
+            "table_header_hex": "#123456",
+            "table_stripe_hex": "#EEEEEE",
+            "header_text": "Running header",
+            "footer_text": "Confidential",
+            "include_page_numbers": True,
+            "blocks": [
+                {
+                    "kind": "title_block",
+                    "kicker": "ANNUAL",
+                    "title": "Rapport annuel",
+                    "subtitle": "Version 2026",
+                    "align": "center",
+                },
+                {"kind": "heading", "text": "Synthèse", "level": 2},
+                {
+                    "kind": "callout",
+                    "title": "Important",
+                    "text": "À lire en priorité",
+                    "fill_hex": "#FFF0D0",
+                    "border_hex": "#ABCDEF",
+                },
+                {
+                    "kind": "paragraph",
+                    "text": "Paragraphe personnalisé",
+                    "bold": True,
+                    "italic": True,
+                    "align": "sideways",
+                },
+                {"kind": "bullet_list", "items": ["Point A", "Point B"]},
+                {"kind": "numbered_list", "items": ["Étape 1", "Étape 2"]},
+                {
+                    "kind": "table",
+                    "caption": "Suivi",
+                    "headers": ["Tâche", "Statut"],
+                    "rows": [["A", "Fait"], ["B", "En cours"], ["C", "À faire"]],
+                },
+                {"kind": "page_break"},
+                {
+                    "kind": "signature_block",
+                    "signatory_role": "Le Directeur",
+                    "signatory_name": "Jean Dupont",
+                },
+            ],
+        }
+        result = execute_word_decision(
+            {"action": "create_new", "title": "Rapport annuel", "design_spec": spec},
+            prompt="Create a new report",
+        )
+        document = Document(BytesIO(result["content"]))
+        section = document.sections[0]
+
+        self.assertEqual(document.styles["Normal"].font.name, "Aptos")
+        self.assertEqual(document.styles["Normal"].font.size.pt, 12.5)
+        self.assertEqual(section.orientation, WD_ORIENT.LANDSCAPE)
+        self.assertGreater(section.page_width, section.page_height)
+        self.assertAlmostEqual(section.top_margin.inches, 0.6)
+        self.assertEqual(
+            [paragraph.text for paragraph in section.header.paragraphs],
+            ["Running header"],
+        )
+        footer = section.footer.paragraphs[0]
+        self.assertIn("Confidential", footer.text)
+        self.assertIn("PAGE", footer._p.xml)
+
+        text = _docx_text(result["content"])
+        for value in (
+            "ANNUAL",
+            "Rapport annuel",
+            "Version 2026",
+            "Synthèse",
+            "À lire en priorité",
+            "Paragraphe personnalisé",
+            "Point A",
+            "Étape 1",
+            "Suivi",
+            "Jean Dupont",
+        ):
+            self.assertIn(value, text)
+
+        title_paragraph = next(
+            paragraph for paragraph in document.paragraphs if paragraph.text == "Rapport annuel"
+        )
+        self.assertEqual(str(title_paragraph.runs[0].font.color.rgb), "123456")
+        body_paragraph = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text == "Paragraphe personnalisé"
+        )
+        self.assertEqual(body_paragraph.alignment, WD_ALIGN_PARAGRAPH.LEFT)
+        self.assertTrue(body_paragraph.runs[0].bold)
+        self.assertTrue(body_paragraph.runs[0].italic)
+
+        self.assertEqual(len(document.tables), 2)
+        callout_cell = document.tables[0].rows[0].cells[0]
+        self.assertEqual(_cell_fill(callout_cell), "FFF0D0")
+        self.assertEqual(_cell_border(callout_cell), "ABCDEF")
+
+        data_table = document.tables[1]
+        self.assertEqual(
+            [cell.text for cell in data_table.rows[0].cells], ["Tâche", "Statut"]
+        )
+        self.assertEqual(_cell_fill(data_table.rows[0].cells[0]), "123456")
+        self.assertTrue(
+            any(
+                _cell_fill(cell) == "EEEEEE"
+                for row in data_table.rows[1:]
+                for cell in row.cells
+            )
+        )
+        self.assertIn("page_break", result["applied_edits"])
+
+    def test_10_design_spec_portrait_margins(self) -> None:
+        spec = {
+            "orientation": "portrait",
+            "margin_inches": 1.4,
+            "blocks": [{"kind": "paragraph", "text": "Portrait"}],
+        }
+        result = execute_word_decision(
+            {"action": "create_new", "design_spec": spec}, prompt="Create a document"
+        )
+        section = Document(BytesIO(result["content"])).sections[0]
+        self.assertEqual(section.orientation, WD_ORIENT.PORTRAIT)
+        self.assertGreater(section.page_height, section.page_width)
+        self.assertAlmostEqual(section.left_margin.inches, 1.4)
+        self.assertAlmostEqual(section.right_margin.inches, 1.4)
+
+    def test_11_invalid_design_values_are_sanitized(self) -> None:
+        spec = {
+            "font_name": "",
+            "base_font_size_pt": 99,
+            "margin_inches": 99,
+            "primary_hex": "not-a-color",
+            "table_header_hex": "bad!",
+            "blocks": [
+                {"kind": "heading", "text": "Titre sûr", "level": 99},
+                {
+                    "kind": "paragraph",
+                    "text": "Alignement sûr",
+                    "align": "sideways",
+                },
+                {
+                    "kind": "table",
+                    "headers": [f"Col {index}" for index in range(25)],
+                    "rows": [
+                        [f"cell {index}" for index in range(25)]
+                        for _ in range(205)
+                    ],
+                },
+            ],
+        }
+        result = execute_word_decision(
+            {"action": "create_new", "design_spec": spec}, prompt="Create a document"
+        )
+        document = Document(BytesIO(result["content"]))
+
+        self.assertEqual(document.styles["Normal"].font.name, "Calibri")
+        self.assertEqual(document.styles["Normal"].font.size.pt, 36.0)
+        self.assertAlmostEqual(document.sections[0].top_margin.inches, 2.0)
+
+        heading = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text == "Titre sûr"
+        )
+        self.assertEqual(heading.style.name, "Heading 6")
+        body = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text == "Alignement sûr"
+        )
+        self.assertEqual(body.alignment, WD_ALIGN_PARAGRAPH.LEFT)
+
+        self.assertEqual(len(document.tables), 1)
+        table = document.tables[0]
+        self.assertEqual(len(table.columns), 20)
+        self.assertEqual(len(table.rows), 201)  # header + 200 capped rows
+        self.assertEqual(_cell_fill(table.rows[0].cells[0]), "1B365D")
+        self.assertEqual(result["warnings"], [])
+
+    def test_12_fallback_builds_design_spec(self) -> None:
+        routed = asyncio.run(
+            gemini_service.route_word_document(
+                "Generate a Word doc about climate data", catalog=self.blueprints
+            )
+        )
+        decision = routed["decision"]
+        self.assertEqual(routed["source"], "fallback")
+        self.assertEqual(decision["action"], "create_new")
+        self.assertTrue(decision["design_spec"]["blocks"])
+
+        result = execute_word_decision(
+            decision, prompt="Generate a Word doc about climate data"
+        )
+        text = _docx_text(result["content"])
+        self.assertIn("climate data", text.lower())
+        self.assertNotIn("Radès", text)
 
 
 if __name__ == "__main__":

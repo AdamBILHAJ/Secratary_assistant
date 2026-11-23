@@ -2,8 +2,8 @@
 
 The API key is optional: when it is missing or Gemini is unreachable, Word
 requests receive a deterministic routing decision with a complete ``new_doc``
-structure instead of a hard failure. Blueprint routes are allowlisted and
-hard-gated when no confident template match exists.
+and ``design_spec`` instead of a hard failure. Blueprint routes are allowlisted
+and hard-gated when no confident template match exists.
 """
 
 from __future__ import annotations
@@ -179,6 +179,91 @@ class WordNewDocument(BaseModel):
     )
 
 
+class WordDesignBlock(BaseModel):
+    """One ordered block in a Gemini-controlled ``create_new`` layout."""
+
+    kind: Literal[
+        "title_block",
+        "heading",
+        "paragraph",
+        "callout",
+        "bullet_list",
+        "numbered_list",
+        "table",
+        "page_break",
+        "signature_block",
+    ]
+    title: str | None = Field(default=None, description="Title or callout heading.")
+    subtitle: str | None = Field(default=None, description="Subtitle under a title.")
+    kicker: str | None = Field(
+        default=None, description="Small accent line above a title."
+    )
+    level: int | None = Field(
+        default=None, description="Heading level (1-6); sanitized by the renderer."
+    )
+    text: str | None = Field(
+        default=None, description="Paragraph or callout body text."
+    )
+    bold: bool | None = Field(default=None, description="Bold paragraph text.")
+    italic: bool | None = Field(default=None, description="Italic paragraph text.")
+    align: str | None = Field(
+        default=None,
+        description="left, center, right or justify; sanitized by the renderer.",
+    )
+    items: list[str] = Field(
+        default_factory=list, description="Items for bullet/numbered lists."
+    )
+    caption: str | None = Field(default=None, description="Optional table caption.")
+    headers: list[str] = Field(default_factory=list, description="Table column headers.")
+    rows: list[list[str]] = Field(default_factory=list, description="Table rows.")
+    fill_hex: str | None = Field(
+        default=None, description="Callout background override."
+    )
+    border_hex: str | None = Field(
+        default=None, description="Callout/table border override."
+    )
+    signatory_role: str | None = Field(
+        default=None, description="Role/title line in a signature block."
+    )
+    signatory_name: str | None = Field(
+        default=None, description="Name line in a signature block."
+    )
+
+
+class WordDesignSpec(BaseModel):
+    """Page-level styling and ordered layout blocks for a new document."""
+
+    font_name: str = Field(default="Calibri", description="Base font family.")
+    base_font_size_pt: float = Field(
+        default=11.0, description="Base font size; renderer clamps to 8-36 pt."
+    )
+    margin_inches: float = Field(
+        default=0.85, description="Uniform margin; renderer clamps to 0.4-2.0 in."
+    )
+    orientation: Literal["portrait", "landscape"] = Field(
+        default="portrait", description="Page orientation."
+    )
+    primary_hex: str = Field(default="#1B365D", description="Headings/primary color.")
+    accent_hex: str = Field(default="#2B6CB0", description="Accents and kickers.")
+    callout_bg_hex: str = Field(
+        default="#F0F4F8", description="Default callout background."
+    )
+    table_header_hex: str = Field(
+        default="#1B365D", description="Table header background."
+    )
+    table_stripe_hex: str = Field(
+        default="#F7FAFC", description="Alternating table row background."
+    )
+    header_text: str | None = Field(default=None, description="Running page header.")
+    footer_text: str | None = Field(default=None, description="Running page footer.")
+    include_page_numbers: bool = Field(
+        default=False, description="Append a PAGE field to the footer."
+    )
+    blocks: list[WordDesignBlock] = Field(
+        default_factory=list, description="Ordered document blocks."
+    )
+
+
 class WordPlan(BaseModel):
     """Structured Word generation/editing plan returned by Gemini."""
 
@@ -205,7 +290,7 @@ class WordRouteDecision(BaseModel):
         description=(
             "use_blueprint: use an allowlisted template with no/minimal changes; "
             "modify_blueprint: apply targeted edits to an allowlisted template; "
-            "create_new: build a clean document from sections/tables."
+            "create_new: build a clean document from design_spec/new_doc."
         )
     )
     blueprint_id: str | None = Field(
@@ -241,6 +326,10 @@ class WordRouteDecision(BaseModel):
     new_doc: WordNewDocument | None = Field(
         default=None,
         description="Complete structure for create_new documents.",
+    )
+    design_spec: WordDesignSpec | None = Field(
+        default=None,
+        description="Gemini-controlled styling and block order for create_new.",
     )
 
 
@@ -929,6 +1018,146 @@ def _fallback_new_doc(
     }
 
 
+def _fallback_design_spec(
+    new_doc: dict[str, Any] | None,
+    prompt: str,
+    target_class: str | None,
+    schedules: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Convert a fallback ``new_doc`` into a clean, ordered design_spec."""
+    document = new_doc or {}
+    blocks: list[dict[str, Any]] = []
+
+    title = str(document.get("title") or "").strip() or str(prompt or "Document").strip()
+    subtitle = str(document.get("subtitle") or "").strip()
+    if title or subtitle:
+        blocks.append(
+            {
+                "kind": "title_block",
+                "title": title or None,
+                "subtitle": subtitle or None,
+                "align": "center",
+            }
+        )
+
+    date_line = str(document.get("date_line") or "").strip()
+    if date_line:
+        blocks.append(
+            {
+                "kind": "paragraph",
+                "text": date_line,
+                "align": "right",
+                "italic": True,
+            }
+        )
+
+    header_note = str(document.get("header_note") or "").strip()
+    if header_note:
+        blocks.append({"kind": "callout", "text": header_note})
+
+    if target_class:
+        blocks.append(
+            {
+                "kind": "paragraph",
+                "text": f"Classe : {target_class}",
+                "bold": True,
+            }
+        )
+
+    for section in document.get("sections") or []:
+        data = section if isinstance(section, dict) else {}
+        heading = str(data.get("heading") or "").strip()
+        if heading:
+            blocks.append({"kind": "heading", "text": heading, "level": 1})
+        for paragraph in data.get("paragraphs") or []:
+            value = str(paragraph).strip()
+            if value:
+                blocks.append({"kind": "paragraph", "text": value})
+        bullets = [str(item).strip() for item in data.get("bullets") or []]
+        bullets = [item for item in bullets if item]
+        if bullets:
+            blocks.append({"kind": "bullet_list", "items": bullets})
+        numbered = [str(item).strip() for item in data.get("numbered_items") or []]
+        numbered = [item for item in numbered if item]
+        if numbered:
+            blocks.append({"kind": "numbered_list", "items": numbered})
+
+    has_schedule_table = False
+    for table in document.get("tables") or []:
+        data = table if isinstance(table, dict) else {}
+        headers = [str(value).strip() for value in data.get("headers") or []]
+        rows = [
+            ["" if value is None else str(value) for value in row]
+            for row in data.get("rows") or []
+        ]
+        normalized = _plain(" ".join(headers))
+        if "jour" in normalized and ("horaire" in normalized or "heure" in normalized):
+            has_schedule_table = True
+        caption = str(data.get("title") or "").strip()
+        if caption:
+            blocks.append({"kind": "heading", "text": caption, "level": 2})
+        if headers:
+            blocks.append(
+                {
+                    "kind": "table",
+                    "caption": None,
+                    "headers": headers,
+                    "rows": rows,
+                }
+            )
+
+    if schedules and not has_schedule_table:
+        blocks.append(
+            {
+                "kind": "table",
+                "caption": "Emploi du temps",
+                "headers": ["Jour", "Horaire", "Matière", "Enseignant", "Salle", "Semaine"],
+                "rows": [
+                    [
+                        str(entry.get("day") or ""),
+                        str(entry.get("time_slot") or ""),
+                        str(entry.get("subject") or ""),
+                        str(entry.get("teacher") or ""),
+                        str(entry.get("room") or ""),
+                        str(entry.get("week") or ""),
+                    ]
+                    for entry in schedules
+                ],
+            }
+        )
+
+    signature = document.get("signature_block")
+    if isinstance(signature, dict):
+        role = str(
+            signature.get("title") or signature.get("role") or ""
+        ).strip()
+        name = str(signature.get("name") or "").strip()
+        if role or name:
+            blocks.append(
+                {
+                    "kind": "signature_block",
+                    "signatory_role": role or None,
+                    "signatory_name": name or None,
+                }
+            )
+
+    return {
+        "font_name": "Calibri",
+        "base_font_size_pt": 11.0,
+        "margin_inches": 0.85,
+        "orientation": "portrait",
+        "primary_hex": "#1B365D",
+        "accent_hex": "#2B6CB0",
+        "callout_bg_hex": "#F0F4F8",
+        "table_header_hex": "#1B365D",
+        "table_stripe_hex": "#F7FAFC",
+        "header_text": None,
+        "footer_text": None,
+        "include_page_numbers": False,
+        "blocks": blocks,
+    }
+
+
 def _fallback_word_route(
     prompt: str,
     target_class: str | None,
@@ -1011,6 +1240,7 @@ def _fallback_word_route(
                 "sections": [],
                 "blueprint_confidence": confidence,
                 "new_doc": None,
+                "design_spec": None,
                 "_fallback_error": error,
             }
 
@@ -1041,6 +1271,9 @@ def _fallback_word_route(
         "sections": plan.get("sections") or [],
         "blueprint_confidence": None,
         "new_doc": new_doc,
+        "design_spec": _fallback_design_spec(
+            new_doc, prompt, target_class, schedules
+        ),
         "_fallback_error": error,
     }
 
@@ -1082,7 +1315,7 @@ def _build_route_prompt(
         "signature, insert a section).\n"
         "- create_new: no allowlisted template fits, the user explicitly wants "
         "a brand-new document, or blueprint confidence is low/ambiguous. "
-        "Populate new_doc completely.\n\n"
+        "Populate both new_doc and a complete design_spec.\n\n"
         "Auto mode (explicit_blueprint_id is null):\n"
         "- Evaluate whether an allowlisted blueprint TRULY fits. Choose a "
         "blueprint action only with a clear match and blueprint_confidence "
@@ -1095,12 +1328,19 @@ def _build_route_prompt(
         "- blueprint_id MUST be an id from allowlisted_blueprints, or null.\n"
         "- For use_blueprint/modify_blueprint, return targeted edits and set "
         "blueprint_confidence. For use_blueprint, only set_date edits are allowed.\n"
-        "- For create_new, set blueprint_id = null and populate new_doc with "
-        "title, optional subtitle, sections (heading/paragraphs/bullets/"
-        "numbered_items), tables (title/headers/rows) and optional signature_block.\n"
-        "- Only set date_line, header_note and signature_block when they are "
-        "relevant to the prompt or institutional context. Never force 'Radès, le ...' "
-        "onto unrelated standalone documents.\n"
+        "- For create_new, set blueprint_id = null. Populate new_doc AND a "
+        "complete design_spec with ordered blocks. Block kinds: title_block, "
+        "heading, paragraph, callout, bullet_list, numbered_list, table, "
+        "page_break, signature_block. Set design_spec styling (font_name, "
+        "base_font_size_pt, margin_inches, orientation, palette colors, optional "
+        "header_text/footer_text/include_page_numbers) to suit the topic and "
+        "language of the prompt.\n"
+        "- Use design_spec.blocks to control visual order. Use callout for "
+        "highlighted notes, table for structured data, and page_break only when "
+        "the document genuinely needs a new page.\n"
+        "- Only set date_line, header_note, signature_block blocks, header_text "
+        "or footer_text when relevant to the prompt or institutional context. "
+        "Never force 'Radès, le ...' onto unrelated standalone documents.\n"
         "- Use schedules when target_class is supplied.\n"
         "- If an explicit_blueprint_id is supplied, it wins: route to that "
         "allowlisted blueprint using use_blueprint or modify_blueprint; never "
@@ -1109,8 +1349,8 @@ def _build_route_prompt(
         "- Keep the summary concise and user-facing. Explain the routing "
         "decision briefly in explanation.\n"
         "- Respond in the language of the prompt (French by default).\n"
-        "Return JSON matching the full schema including blueprint_confidence "
-        "and new_doc."
+        "Return JSON matching the full schema including blueprint_confidence, "
+        "new_doc and design_spec."
     )
 
 
@@ -1139,6 +1379,7 @@ def _apply_route_gate(
             if action == "create_new":
                 action = "modify_blueprint" if decision.edits else "use_blueprint"
                 decision.sections = []
+                decision.design_spec = None
                 explanation = (
                     f"{explanation} Explicit allowlisted blueprint selected; "
                     "routing to that template."
@@ -1207,8 +1448,19 @@ def _apply_route_gate(
 
         decision.title = decision.title or str(new_doc_data.get("title") or "")
 
+        design_data = (
+            decision.design_spec.model_dump()
+            if decision.design_spec is not None
+            else None
+        )
+        if not design_data or not design_data.get("blocks"):
+            design_data = _fallback_design_spec(
+                new_doc_data, prompt, target_class, schedules
+            )
+            decision.design_spec = WordDesignSpec.model_validate(design_data)
+
         # Keep the legacy fields populated for older callers while the builder
-        # renders the richer new_doc structure.
+        # renders the richer design_spec/new_doc structure.
         legacy_sections: list[dict[str, Any]] = []
         for section in new_doc_data.get("sections") or []:
             body_lines = [
@@ -1245,6 +1497,7 @@ def _apply_route_gate(
         decision.signature_name = signature_block.get("name")
     else:
         decision.new_doc = None
+        decision.design_spec = None
         if action == "use_blueprint":
             decision.edits = [
                 edit for edit in decision.edits if edit.action == "set_date"
@@ -1476,11 +1729,15 @@ async def route_word_document(
                     contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=(
-                            "You are a precise Word document router. In Auto mode, "
-                            "use a blueprint only for a clear allowlisted match with "
-                            "confidence >= 0.7; otherwise build a complete new_doc. "
-                            "Explicit from-scratch requests always create a new "
-                            "document unless an explicit blueprint override is given. "
+                            "You are a precise Word document router and layout "
+                            "designer. In Auto mode, use a blueprint only for a "
+                            "clear allowlisted match with confidence >= 0.7; "
+                            "otherwise create_new. Every create_new decision must "
+                            "include a complete design_spec with ordered blocks and "
+                            "topic-appropriate styling. Explicit from-scratch "
+                            "requests always create a new document unless an "
+                            "explicit blueprint override is given. Never force "
+                            "institutional headers or dates onto unrelated topics. "
                             "Only select blueprint ids from the supplied allowlist. "
                             "Never invent data or blueprint references."
                         ),

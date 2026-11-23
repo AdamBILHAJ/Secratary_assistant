@@ -341,20 +341,50 @@ Generation is prompt-driven. Gemini (`GEMINI_MODEL`, default
 | --- | --- |
 | `use_blueprint` | An allowlisted `.docx` is copied with no changes or an optional date update. |
 | `modify_blueprint` | Targeted edits are applied on a copy of an allowlisted `.docx`. |
-| `create_new` | A clean `.docx` is built from the enriched `new_doc` structure. |
+| `create_new` | A clean `.docx` is built from Gemini's `design_spec` (Option A). |
 
 With no `blueprint_id` (or an empty string) the router is in **Auto mode**: it
 uses a blueprint only when the request clearly matches an allowlisted template.
 Phrases such as `from scratch`, `without blueprint`, `new document`, `sans
 modèle` or `nouveau document` always force `create_new`. Low-confidence or
-invalid blueprint selections are hard-gated to `create_new`, which is built
-from a complete `new_doc` payload: `title`, optional `subtitle`, `date_line`,
-`header_note`, `sections` (`heading`, `paragraphs`, `bullets`,
-`numbered_items`), `tables` (`title`, `headers`, `rows`), and an optional
-`signature_block`. Date/signature lines are only rendered when they are
-present in the payload, so unrelated documents never receive a forced
-`Radès, le ...` line. An explicit allowlisted `blueprint_id` still overrides
-Auto mode.
+invalid blueprint selections are hard-gated to `create_new`. An explicit
+allowlisted `blueprint_id` still overrides Auto mode.
+
+#### Option A: Gemini-controlled `design_spec`
+
+Every `create_new` decision carries a `design_spec` that controls styling and
+visual block order. Gemini chooses these values from the prompt's topic and
+language; the deterministic fallback produces a clean default design when
+Gemini is unavailable.
+
+| Field | Meaning |
+| --- | --- |
+| `font_name`, `base_font_size_pt` | Base font family and size (renderer clamps to 8-36 pt). |
+| `margin_inches`, `orientation` | Uniform page margin (0.4-2.0 in) and `portrait`/`landscape`. |
+| `primary_hex`, `accent_hex` | Heading/title and accent colors. |
+| `callout_bg_hex`, `table_header_hex`, `table_stripe_hex` | Callout, table header and alternating-row colors. |
+| `header_text`, `footer_text`, `include_page_numbers` | Optional running header/footer and a `PAGE` field. |
+| `blocks` | Ordered content blocks. |
+
+Supported block `kind` values are `title_block`, `heading`, `paragraph`,
+`callout`, `bullet_list`, `numbered_list`, `table`, `page_break`, and
+`signature_block`. Blocks may set `title`, `subtitle`, `kicker`, `level`,
+`text`, `bold`, `italic`, `align`, `items`, `caption`, `headers`, `rows`,
+`fill_hex`, `border_hex`, `signatory_role`, and `signatory_name`.
+
+`build_standalone_document()` sanitizes every value before handing it to
+`python-docx`: invalid hex colors fall back to the palette defaults, font
+sizes and margins are clamped, alignment is limited to `left`/`center`/
+`right`/`justify`, heading levels are clamped to 1-6, and oversized tables are
+capped and padded to a consistent shape. Only `create_new` uses this renderer;
+`use_blueprint` and `modify_blueprint` still edit a copy of the selected
+template.
+
+For backward compatibility, older clients may still send the `new_doc`
+payload (`title`, `subtitle`, `date_line`, `header_note`, `sections`, `tables`,
+`signature_block`). It is adapted into the same block pipeline. Date, header
+note and signature blocks are only rendered when present, so unrelated
+standalone documents never receive a forced `Radès, le ...` line.
 
 Blueprints are restricted to an explicit allowlist: two bundled `Liste des
 Besoins` templates plus templates registered through the upload endpoint

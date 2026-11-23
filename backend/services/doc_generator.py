@@ -9,9 +9,9 @@ Two generation modes are supported:
 * ``generate_from_blueprint`` opens an existing template, applies a list of
   targeted edits (date, title, table rows, signature, ...) and returns the
   generated ``.docx`` bytes.
-* ``build_standalone_document`` creates a clean document from the enriched
-  ``new_doc`` structure (title/subtitle, blocks, tables, optional sign-off)
-  when no template is selected.
+* ``build_standalone_document`` creates a clean document from a Gemini-designed
+  ``design_spec`` (ordered blocks, palette, page setup) when no template is
+  selected. Legacy ``new_doc`` payloads are adapted into the same pipeline.
 """
 
 from __future__ import annotations
@@ -22,19 +22,36 @@ import json
 import logging
 import re
 import unicodedata
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 from docx import Document
+from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Inches, Pt, RGBColor
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DESIGN_FONT = "Calibri"
+DEFAULT_DESIGN_SIZE_PT = 11.0
+DEFAULT_DESIGN_MARGIN_IN = 0.85
+DEFAULT_PRIMARY_HEX = "1B365D"
+DEFAULT_ACCENT_HEX = "2B6CB0"
+DEFAULT_CALLOUT_HEX = "F0F4F8"
+DEFAULT_TABLE_HEADER_HEX = "1B365D"
+DEFAULT_TABLE_STRIPE_HEX = "F7FAFC"
+MIN_FONT_SIZE_PT = 8.0
+MAX_FONT_SIZE_PT = 36.0
+MIN_MARGIN_IN = 0.4
+MAX_MARGIN_IN = 2.0
+MAX_TABLE_COLUMNS = 20
+MAX_TABLE_ROWS = 200
+MAX_CELL_CHARS = 2000
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = BACKEND_DIR.parent
@@ -562,6 +579,8 @@ def _normalize_plan(plan: Any) -> dict[str, Any]:
     data["sections"] = [_as_dict(section) for section in data.get("sections") or []]
     if data.get("new_doc"):
         data["new_doc"] = _as_dict(data["new_doc"])
+    if data.get("design_spec"):
+        data["design_spec"] = _as_dict(data["design_spec"])
     return data
 
 
@@ -893,6 +912,8 @@ def _shade_cell(cell, fill: str = "DCE6F1") -> None:
     """Apply a light background fill to a table cell (header styling)."""
     try:
         properties = cell._tc.get_or_add_tcPr()
+        for existing in properties.findall(qn("w:shd")):
+            properties.remove(existing)
         shading = OxmlElement("w:shd")
         shading.set(qn("w:val"), "clear")
         shading.set(qn("w:color"), "auto")
@@ -910,6 +931,165 @@ def _style_header_row(table: Table) -> None:
         for paragraph in cell.paragraphs:
             for run in paragraph.runs:
                 run.bold = True
+
+
+def _sanitize_hex(value: Any, default: str = DEFAULT_PRIMARY_HEX) -> str:
+    """Return a safe six-digit RGB hex string without a leading ``#``."""
+    text = str(value or "").strip()
+    if text.startswith("#"):
+        text = text[1:]
+    if re.fullmatch(r"[0-9a-fA-F]{3}", text):
+        text = "".join(char * 2 for char in text)
+    if re.fullmatch(r"[0-9a-fA-F]{6}", text):
+        return text.upper()
+    return default.upper()
+
+
+def _sanitize_font_name(value: Any, default: str = DEFAULT_DESIGN_FONT) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 80 or any(char in text for char in '\\/:*?"<>|'):
+        return default
+    return text
+
+
+def _sanitize_font_size(value: Any, default: float = DEFAULT_DESIGN_SIZE_PT) -> float:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return default
+    if size != size or size in (float("inf"), float("-inf")):
+        return default
+    return min(max(size, MIN_FONT_SIZE_PT), MAX_FONT_SIZE_PT)
+
+
+def _sanitize_margin(value: Any, default: float = DEFAULT_DESIGN_MARGIN_IN) -> float:
+    try:
+        margin = float(value)
+    except (TypeError, ValueError):
+        return default
+    if margin != margin or margin in (float("inf"), float("-inf")):
+        return default
+    return min(max(margin, MIN_MARGIN_IN), MAX_MARGIN_IN)
+
+
+def _sanitize_align(value: Any, default: str = "left") -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "center": "center",
+        "centre": "center",
+        "left": "left",
+        "right": "right",
+        "justify": "justify",
+        "justified": "justify",
+    }
+    return aliases.get(text, default)
+
+
+def _alignment(value: Any, default: str = "left"):
+    return {
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+    }[_sanitize_align(value, default)]
+
+
+def _sanitize_level(value: Any, default: int = 1) -> int:
+    try:
+        level = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(level, 1), 6)
+
+
+def _sanitize_table(
+    headers: Any, rows: Any
+) -> tuple[list[str], list[list[str]]]:
+    """Cap table dimensions and normalize every row to the header count."""
+    raw_headers = [str(value).strip() for value in (headers or []) if str(value).strip()]
+    raw_rows = [row for row in (rows or []) if isinstance(row, (list, tuple))]
+
+    if not raw_headers and raw_rows:
+        column_count = min(
+            max(len(row) for row in raw_rows), MAX_TABLE_COLUMNS
+        )
+        raw_headers = [f"Column {index}" for index in range(1, column_count + 1)]
+
+    sanitized_headers = [
+        value[:MAX_CELL_CHARS] for value in raw_headers[:MAX_TABLE_COLUMNS]
+    ]
+    column_count = len(sanitized_headers)
+    if not column_count:
+        return [], []
+
+    sanitized_rows: list[list[str]] = []
+    for row in raw_rows[:MAX_TABLE_ROWS]:
+        values = [
+            "" if value is None else str(value)[:MAX_CELL_CHARS]
+            for value in list(row)[:column_count]
+        ]
+        values.extend([""] * (column_count - len(values)))
+        sanitized_rows.append(values)
+    return sanitized_headers, sanitized_rows
+
+
+def _set_cell_borders(cell, color: str, *, size: int = 6) -> None:
+    """Apply a single-line border to all four edges of a table cell."""
+    try:
+        properties = cell._tc.get_or_add_tcPr()
+        borders = properties.find(qn("w:tcBorders"))
+        if borders is None:
+            borders = OxmlElement("w:tcBorders")
+            properties.append(borders)
+        for edge in ("top", "left", "bottom", "right"):
+            tag = qn(f"w:{edge}")
+            element = borders.find(tag)
+            if element is None:
+                element = OxmlElement(f"w:{edge}")
+                borders.append(element)
+            element.set(qn("w:val"), "single")
+            element.set(qn("w:sz"), str(size))
+            element.set(qn("w:space"), "0")
+            element.set(qn("w:color"), color)
+    except Exception:  # pragma: no cover - depends on python-docx internals
+        logger.debug("Could not style table cell borders", exc_info=True)
+
+
+def _apply_run_style(
+    run,
+    *,
+    font_name: str,
+    font_size: float,
+    color: str | None = None,
+    bold: bool | None = None,
+    italic: bool | None = None,
+) -> None:
+    run.font.name = font_name
+    run.font.size = Pt(font_size)
+    if color:
+        run.font.color.rgb = RGBColor.from_string(color)
+    if bold is not None:
+        run.bold = bool(bold)
+    if italic is not None:
+        run.italic = bool(italic)
+
+
+def _add_page_number(paragraph) -> None:
+    """Append a Word ``PAGE`` field to a header/footer paragraph."""
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = " PAGE "
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    placeholder = OxmlElement("w:t")
+    placeholder.text = "1"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    for element in (begin, instruction, separate, placeholder, end):
+        run._r.append(element)
 
 
 def _append_section(
@@ -1277,90 +1457,6 @@ def _schedule_rows(schedules: list[dict[str, Any]] | None) -> list[list[str]]:
     return rows
 
 
-def _has_schedule_table(sections: list[dict[str, Any]]) -> bool:
-    for section in sections:
-        columns = section.get("columns") or []
-        normalized = _normalize(" ".join(str(column) for column in columns))
-        if "jour" in normalized and ("horaire" in normalized or "heure" in normalized):
-            return True
-    return False
-
-
-def _default_standalone_sections(
-    schedules: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]]:
-    sections: list[dict[str, Any]] = [
-        {
-            "heading": "Informations",
-            "body": "Département Technologies de l'Informatique — ISET Radès",
-        }
-    ]
-
-    rows = _schedule_rows(schedules)
-    if rows:
-        sections.append(
-            {
-                "heading": "Emploi du temps",
-                "columns": ["Jour", "Horaire", "Matière", "Enseignant", "Salle", "Semaine"],
-                "rows": rows,
-            }
-        )
-    return sections
-
-
-def _add_new_heading(document, text: str, *, level: int = 1) -> None:
-    """Add a styled heading, falling back to direct formatting."""
-    style = f"Heading {level}"
-    try:
-        document.add_paragraph(text, style=style)
-        return
-    except (KeyError, ValueError):
-        paragraph = document.add_paragraph()
-        run = paragraph.add_run(text)
-        run.bold = True
-        run.font.size = Pt(14)
-
-
-def _add_new_list(
-    document,
-    items: list[Any] | None,
-    *,
-    numbered: bool = False,
-) -> int:
-    """Add bullet or numbered items using Word list styles."""
-    style = "List Number" if numbered else "List Bullet"
-    added = 0
-    for index, item in enumerate(items or [], start=1):
-        text = str(item).strip()
-        if not text:
-            continue
-        try:
-            document.add_paragraph(text, style=style)
-        except (KeyError, ValueError):
-            prefix = f"{index}. " if numbered else "• "
-            document.add_paragraph(prefix + text)
-        added += 1
-    return added
-
-
-def _render_signature_block(document, block: Any) -> bool:
-    data = _as_dict(block)
-    lines: list[str] = []
-    for key in ("title", "role", "organization", "name"):
-        value = str(data.get(key) or "").strip()
-        if value and value not in lines:
-            lines.append(value)
-    if not lines:
-        return False
-
-    document.add_paragraph("")
-    for line in lines:
-        paragraph = document.add_paragraph()
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        paragraph.add_run(line)
-    return True
-
-
 def _new_doc_has_schedule_table(tables: list[dict[str, Any]]) -> bool:
     for table in tables:
         normalized = _normalize(
@@ -1442,57 +1538,70 @@ def _legacy_plan_to_new_doc(
     }
 
 
-def build_standalone_document(
-    plan: Any,
-    subject: str,
-    target_class: str | None = None,
-    schedules: list[dict[str, Any]] | None = None,
+def _design_spec_from_new_doc(
+    new_doc: dict[str, Any],
+    target_class: str | None,
+    schedules: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
-    """Build a clean Word document from the enriched ``new_doc`` structure."""
-    plan_data = _normalize_plan(plan)
-    new_doc = _as_dict(plan_data.get("new_doc")) if plan_data.get("new_doc") else None
-    if not new_doc:
-        new_doc = _legacy_plan_to_new_doc(plan_data, subject, schedules)
+    """Adapt the legacy ``new_doc`` shape into an ordered design_spec."""
+    document = _as_dict(new_doc)
+    blocks: list[dict[str, Any]] = []
 
-    document = Document()
-    applied: list[str] = []
-    warnings: list[str] = []
+    title = str(document.get("title") or "").strip()
+    subtitle = str(document.get("subtitle") or "").strip()
+    if title or subtitle:
+        blocks.append(
+            {
+                "kind": "title_block",
+                "title": title or None,
+                "subtitle": subtitle or None,
+                "align": "center",
+            }
+        )
 
-    title = str(new_doc.get("title") or "").strip() or str(subject or "Document").strip()
-    title_paragraph = document.add_paragraph()
-    title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title_run = title_paragraph.add_run(title)
-    title_run.bold = True
-    title_run.font.size = Pt(18)
-
-    subtitle = str(new_doc.get("subtitle") or "").strip()
-    if subtitle:
-        paragraph = document.add_paragraph()
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = paragraph.add_run(subtitle)
-        run.italic = True
-        run.font.size = Pt(12)
-
-    date_line = str(new_doc.get("date_line") or "").strip()
+    date_line = str(document.get("date_line") or "").strip()
     if date_line:
-        paragraph = document.add_paragraph()
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        paragraph.add_run(date_line)
+        blocks.append(
+            {
+                "kind": "paragraph",
+                "text": date_line,
+                "align": "right",
+                "italic": True,
+            }
+        )
 
-    header_note = str(new_doc.get("header_note") or "").strip()
+    header_note = str(document.get("header_note") or "").strip()
     if header_note:
-        paragraph = document.add_paragraph()
-        run = paragraph.add_run(header_note)
-        run.italic = True
+        blocks.append({"kind": "callout", "text": header_note})
 
     if target_class:
-        paragraph = document.add_paragraph()
-        run = paragraph.add_run(f"Classe : {target_class}")
-        run.bold = True
+        blocks.append(
+            {
+                "kind": "paragraph",
+                "text": f"Classe : {target_class}",
+                "bold": True,
+            }
+        )
 
-    tables: list[dict[str, Any]] = [
-        _as_dict(table) for table in new_doc.get("tables") or []
-    ]
+    tables = [_as_dict(table) for table in document.get("tables") or []]
+    for section in document.get("sections") or []:
+        data = _as_dict(section)
+        heading = str(data.get("heading") or "").strip()
+        if heading:
+            blocks.append({"kind": "heading", "text": heading, "level": 1})
+        for value in data.get("paragraphs") or []:
+            text = str(value).strip()
+            if text:
+                blocks.append({"kind": "paragraph", "text": text})
+        bullets = [str(item).strip() for item in data.get("bullets") or []]
+        bullets = [item for item in bullets if item]
+        if bullets:
+            blocks.append({"kind": "bullet_list", "items": bullets})
+        numbered = [str(item).strip() for item in data.get("numbered_items") or []]
+        numbered = [item for item in numbered if item]
+        if numbered:
+            blocks.append({"kind": "numbered_list", "items": numbered})
+
     if schedules and not _new_doc_has_schedule_table(tables):
         tables.append(
             {
@@ -1502,64 +1611,500 @@ def build_standalone_document(
             }
         )
 
-    sections = [_as_dict(section) for section in new_doc.get("sections") or []]
-    for section in sections:
-        try:
-            heading = str(section.get("heading") or "").strip()
-            if heading:
-                _add_new_heading(document, heading, level=1)
-                applied.append("insert_heading")
-
-            paragraphs = [
-                str(value).strip()
-                for value in section.get("paragraphs") or []
-                if str(value).strip()
-            ]
-            for value in paragraphs:
-                document.add_paragraph(value)
-                applied.append("insert_paragraph")
-
-            bullets = _add_new_list(document, section.get("bullets") or [])
-            numbered = _add_new_list(
-                document, section.get("numbered_items") or [], numbered=True
-            )
-            if bullets:
-                applied.append("insert_bullets")
-            if numbered:
-                applied.append("insert_numbered_items")
-        except Exception as exc:
-            logger.exception("Standalone Word section rendering failed")
-            warnings.append(f"insert_section: {type(exc).__name__}: {exc}")
-
     for table in tables:
+        blocks.append(
+            {
+                "kind": "table",
+                "caption": str(table.get("title") or "").strip() or None,
+                "headers": table.get("headers") or [],
+                "rows": table.get("rows") or [],
+            }
+        )
+
+    signature = _as_dict(document.get("signature_block"))
+    if signature:
+        role = str(signature.get("title") or signature.get("role") or "").strip()
+        name = str(signature.get("name") or "").strip()
+        if role or name:
+            blocks.append(
+                {
+                    "kind": "signature_block",
+                    "signatory_role": role or None,
+                    "signatory_name": name or None,
+                }
+            )
+
+    return {
+        "font_name": DEFAULT_DESIGN_FONT,
+        "base_font_size_pt": DEFAULT_DESIGN_SIZE_PT,
+        "margin_inches": DEFAULT_DESIGN_MARGIN_IN,
+        "orientation": "portrait",
+        "primary_hex": f"#{DEFAULT_PRIMARY_HEX}",
+        "accent_hex": f"#{DEFAULT_ACCENT_HEX}",
+        "callout_bg_hex": f"#{DEFAULT_CALLOUT_HEX}",
+        "table_header_hex": f"#{DEFAULT_TABLE_HEADER_HEX}",
+        "table_stripe_hex": f"#{DEFAULT_TABLE_STRIPE_HEX}",
+        "header_text": None,
+        "footer_text": None,
+        "include_page_numbers": False,
+        "blocks": blocks,
+    }
+
+
+def _design_has_schedule_table(blocks: list[dict[str, Any]]) -> bool:
+    for block in blocks:
+        if str(block.get("kind") or "") != "table":
+            continue
+        headers = [str(value) for value in block.get("headers") or []]
+        normalized = _normalize(" ".join(headers))
+        if "jour" in normalized and ("horaire" in normalized or "heure" in normalized):
+            return True
+    return False
+
+
+def _design_context(spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "font": _sanitize_font_name(spec.get("font_name")),
+        "size": _sanitize_font_size(spec.get("base_font_size_pt")),
+        "primary": _sanitize_hex(spec.get("primary_hex"), DEFAULT_PRIMARY_HEX),
+        "accent": _sanitize_hex(spec.get("accent_hex"), DEFAULT_ACCENT_HEX),
+        "callout": _sanitize_hex(spec.get("callout_bg_hex"), DEFAULT_CALLOUT_HEX),
+        "table_header": _sanitize_hex(
+            spec.get("table_header_hex"), DEFAULT_TABLE_HEADER_HEX
+        ),
+        "stripe": _sanitize_hex(spec.get("table_stripe_hex"), DEFAULT_TABLE_STRIPE_HEX),
+    }
+
+
+def _configure_design_page(
+    document,
+    spec: dict[str, Any],
+    context: dict[str, Any],
+    applied: list[str],
+) -> None:
+    section = document.sections[0]
+    orientation = str(spec.get("orientation") or "portrait").strip().lower()
+    width, height = section.page_width, section.page_height
+    if orientation == "landscape":
+        section.orientation = WD_ORIENT.LANDSCAPE
+        if width < height:
+            section.page_width, section.page_height = height, width
+        applied.append("set_landscape")
+    else:
+        section.orientation = WD_ORIENT.PORTRAIT
+        if width > height:
+            section.page_width, section.page_height = height, width
+        applied.append("set_portrait")
+
+    margin = Inches(_sanitize_margin(spec.get("margin_inches")))
+    section.top_margin = margin
+    section.bottom_margin = margin
+    section.left_margin = margin
+    section.right_margin = margin
+    applied.append("set_margins")
+
+    normal = document.styles["Normal"]
+    normal.font.name = context["font"]
+    normal.font.size = Pt(context["size"])
+    applied.append("set_base_font")
+
+    small_size = min(context["size"], 9.0)
+    header_text = str(spec.get("header_text") or "").strip()
+    if header_text:
+        paragraph = section.header.paragraphs[0]
+        paragraph.text = header_text
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        for run in paragraph.runs:
+            _apply_run_style(
+                run,
+                font_name=context["font"],
+                font_size=small_size,
+                color=context["accent"],
+            )
+        applied.append("set_header")
+
+    footer_text = str(spec.get("footer_text") or "").strip()
+    include_page_numbers = bool(spec.get("include_page_numbers"))
+    if footer_text or include_page_numbers:
+        paragraph = section.footer.paragraphs[0]
+        paragraph.text = ""
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if footer_text:
+            run = paragraph.add_run(footer_text)
+            _apply_run_style(
+                run,
+                font_name=context["font"],
+                font_size=small_size,
+                color=context["accent"],
+            )
+        if include_page_numbers:
+            prefix = "  " if footer_text else ""
+            run = paragraph.add_run(f"{prefix}Page ")
+            _apply_run_style(
+                run,
+                font_name=context["font"],
+                font_size=small_size,
+                color=context["accent"],
+            )
+            _add_page_number(paragraph)
+        applied.append("set_footer")
+
+
+def _add_design_heading(
+    document, text: str, level: Any, context: dict[str, Any]
+) -> None:
+    safe_level = _sanitize_level(level)
+    try:
+        paragraph = document.add_paragraph(text, style=f"Heading {safe_level}")
+    except (KeyError, ValueError):
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run(text)
+        _apply_run_style(
+            run,
+            font_name=context["font"],
+            font_size=max(context["size"] + 2, 12.0),
+            color=context["primary"],
+            bold=True,
+        )
+        return
+    for run in paragraph.runs:
+        _apply_run_style(
+            run,
+            font_name=context["font"],
+            font_size=max(context["size"] + 2, 12.0),
+            color=context["primary"],
+            bold=True,
+        )
+
+
+def _add_design_paragraph(
+    document, block: dict[str, Any], context: dict[str, Any]
+) -> None:
+    text = str(block.get("text") or "").strip()
+    if not text:
+        return
+    paragraph = document.add_paragraph()
+    paragraph.alignment = _alignment(block.get("align"))
+    run = paragraph.add_run(text)
+    _apply_run_style(
+        run,
+        font_name=context["font"],
+        font_size=context["size"],
+        bold=block.get("bold"),
+        italic=block.get("italic"),
+    )
+
+
+def _add_design_list(
+    document,
+    items: list[Any] | None,
+    context: dict[str, Any],
+    *,
+    numbered: bool,
+) -> int:
+    style = "List Number" if numbered else "List Bullet"
+    added = 0
+    for index, item in enumerate(items or [], start=1):
+        text = str(item).strip()
+        if not text:
+            continue
         try:
-            caption = str(table.get("title") or "").strip()
-            if caption:
-                paragraph = document.add_paragraph()
-                run = paragraph.add_run(caption)
-                run.bold = True
+            paragraph = document.add_paragraph(text, style=style)
+        except (KeyError, ValueError):
+            prefix = f"{index}. " if numbered else "• "
+            paragraph = document.add_paragraph(prefix + text)
+        for run in paragraph.runs:
+            _apply_run_style(run, font_name=context["font"], font_size=context["size"])
+        added += 1
+    return added
 
-            headers = [
-                str(column)
-                for column in table.get("headers") or []
-                if str(column).strip()
-            ]
-            rows = [
-                ["" if value is None else str(value) for value in row]
-                for row in table.get("rows") or []
-            ]
-            if headers and _add_table(document, headers, rows, "Table Grid") is not None:
-                applied.append("insert_table")
-                document.add_paragraph("")
+
+def _add_design_callout(
+    document, block: dict[str, Any], context: dict[str, Any]
+) -> bool:
+    title = str(block.get("title") or "").strip()
+    text = str(block.get("text") or "").strip()
+    if not title and not text:
+        return False
+
+    table = document.add_table(rows=1, cols=1)
+    try:
+        table.style = "Table Grid"
+    except (KeyError, ValueError):
+        pass
+    cell = table.rows[0].cells[0]
+    if title:
+        heading = cell.paragraphs[0]
+        run = heading.add_run(title)
+        _apply_run_style(
+            run,
+            font_name=context["font"],
+            font_size=context["size"],
+            color=context["primary"],
+            bold=True,
+        )
+        if text:
+            body = cell.add_paragraph()
+            run = body.add_run(text)
+            _apply_run_style(
+                run,
+                font_name=context["font"],
+                font_size=context["size"],
+                italic=True,
+            )
+    else:
+        run = cell.paragraphs[0].add_run(text)
+        _apply_run_style(
+            run,
+            font_name=context["font"],
+            font_size=context["size"],
+            italic=True,
+        )
+
+    fill = _sanitize_hex(block.get("fill_hex"), context["callout"])
+    border = _sanitize_hex(block.get("border_hex"), context["accent"])
+    _shade_cell(cell, fill)
+    _set_cell_borders(cell, border, size=8)
+    document.add_paragraph("")
+    return True
+
+
+def _add_design_table(
+    document, block: dict[str, Any], context: dict[str, Any]
+) -> bool:
+    caption = str(block.get("caption") or "").strip()
+    if caption:
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run(caption)
+        _apply_run_style(
+            run,
+            font_name=context["font"],
+            font_size=context["size"],
+            color=context["primary"],
+            bold=True,
+        )
+
+    headers, rows = _sanitize_table(block.get("headers"), block.get("rows"))
+    if not headers:
+        return False
+    table = _add_table(document, headers, rows, "Table Grid")
+    if table is None:
+        return False
+
+    border = _sanitize_hex(block.get("border_hex"), context["primary"])
+    for row_index, row in enumerate(table.rows):
+        for cell in row.cells:
+            _set_cell_borders(cell, border)
+            if row_index == 0:
+                _shade_cell(cell, context["table_header"])
+            elif row_index % 2 == 0:
+                _shade_cell(cell, context["stripe"])
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    _apply_run_style(
+                        run,
+                        font_name=context["font"],
+                        font_size=context["size"],
+                        color="FFFFFF" if row_index == 0 else None,
+                        bold=row_index == 0,
+                    )
+    document.add_paragraph("")
+    return True
+
+
+def _add_design_signature(
+    document, block: dict[str, Any], context: dict[str, Any]
+) -> bool:
+    role = str(block.get("signatory_role") or "").strip()
+    name = str(block.get("signatory_name") or "").strip()
+    if not role and not name:
+        return False
+
+    document.add_paragraph("")
+    for value, is_role in ((role, True), (name, False)):
+        if not value:
+            continue
+        paragraph = document.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        run = paragraph.add_run(value)
+        _apply_run_style(
+            run,
+            font_name=context["font"],
+            font_size=context["size"],
+            color=context["primary"] if is_role else None,
+            bold=is_role,
+        )
+    return True
+
+
+def _render_design_spec(
+    document,
+    spec: dict[str, Any],
+    applied: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    context = _design_context(spec)
+    _configure_design_page(document, spec, context, applied)
+
+    for raw_block in spec.get("blocks") or []:
+        block = _as_dict(raw_block)
+        kind = str(block.get("kind") or "").strip()
+        try:
+            if kind == "title_block":
+                kicker = str(block.get("kicker") or "").strip()
+                if kicker:
+                    paragraph = document.add_paragraph()
+                    paragraph.alignment = _alignment(
+                        block.get("align"), "center"
+                    )
+                    run = paragraph.add_run(kicker)
+                    _apply_run_style(
+                        run,
+                        font_name=context["font"],
+                        font_size=max(context["size"] - 1, MIN_FONT_SIZE_PT),
+                        color=context["accent"],
+                        bold=True,
+                    )
+
+                title = str(block.get("title") or "").strip()
+                if title:
+                    paragraph = document.add_paragraph()
+                    paragraph.alignment = _alignment(
+                        block.get("align"), "center"
+                    )
+                    run = paragraph.add_run(title)
+                    _apply_run_style(
+                        run,
+                        font_name=context["font"],
+                        font_size=min(max(context["size"] + 7, 18.0), MAX_FONT_SIZE_PT),
+                        color=context["primary"],
+                        bold=True,
+                    )
+
+                subtitle = str(block.get("subtitle") or "").strip()
+                if subtitle:
+                    paragraph = document.add_paragraph()
+                    paragraph.alignment = _alignment(
+                        block.get("align"), "center"
+                    )
+                    run = paragraph.add_run(subtitle)
+                    _apply_run_style(
+                        run,
+                        font_name=context["font"],
+                        font_size=min(max(context["size"] + 1, 12.0), MAX_FONT_SIZE_PT),
+                        color=context["accent"],
+                        italic=True,
+                    )
+                applied.append("insert_title_block")
+            elif kind == "heading":
+                text = str(block.get("text") or block.get("title") or "").strip()
+                if text:
+                    _add_design_heading(document, text, block.get("level"), context)
+                    applied.append("insert_heading")
+            elif kind == "paragraph":
+                _add_design_paragraph(document, block, context)
+                applied.append("insert_paragraph")
+            elif kind == "callout":
+                if _add_design_callout(document, block, context):
+                    applied.append("insert_callout")
+            elif kind == "bullet_list":
+                if _add_design_list(
+                    document, block.get("items"), context, numbered=False
+                ):
+                    applied.append("insert_bullets")
+            elif kind == "numbered_list":
+                if _add_design_list(
+                    document, block.get("items"), context, numbered=True
+                ):
+                    applied.append("insert_numbered_items")
+            elif kind == "table":
+                if _add_design_table(document, block, context):
+                    applied.append("insert_table")
+            elif kind == "page_break":
+                document.add_page_break()
+                applied.append("page_break")
+            elif kind == "signature_block":
+                if _add_design_signature(document, block, context):
+                    applied.append("set_signature")
+            else:
+                warnings.append(f"unknown_design_block: {kind}")
+                logger.warning("Unknown design_spec block kind: %s", kind)
         except Exception as exc:
-            logger.exception("Standalone Word table rendering failed")
-            warnings.append(f"insert_table: {type(exc).__name__}: {exc}")
+            logger.exception("Failed to render design_spec block %s", kind)
+            warnings.append(f"design_block:{kind}: {type(exc).__name__}: {exc}")
+    return context
 
-    if new_doc.get("signature_block") and _render_signature_block(
-        document, new_doc["signature_block"]
-    ):
-        applied.append("set_signature")
 
+def build_standalone_document(
+    plan: Any,
+    subject: str,
+    target_class: str | None = None,
+    schedules: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build a clean Word document from ``design_spec`` (or legacy ``new_doc``)."""
+    plan_data = _normalize_plan(plan)
+    new_doc = _as_dict(plan_data.get("new_doc")) if plan_data.get("new_doc") else None
+    if not new_doc:
+        new_doc = _legacy_plan_to_new_doc(plan_data, subject, schedules)
+
+    provided_spec = (
+        _as_dict(plan_data.get("design_spec")) if plan_data.get("design_spec") else None
+    )
+    provided_blocks = (
+        [_as_dict(block) for block in provided_spec.get("blocks") or []]
+        if provided_spec
+        else []
+    )
+
+    if provided_spec and provided_blocks:
+        spec = dict(provided_spec)
+        spec["blocks"] = provided_blocks
+    else:
+        generated = _design_spec_from_new_doc(new_doc, target_class, schedules)
+        if provided_spec:
+            # Keep Gemini's styling choices but supply the missing blocks.
+            spec = {
+                **generated,
+                **{
+                    key: value
+                    for key, value in provided_spec.items()
+                    if key != "blocks"
+                },
+            }
+            spec["blocks"] = generated["blocks"]
+        else:
+            spec = generated
+
+    blocks = [_as_dict(block) for block in spec.get("blocks") or []]
+    if schedules and not _design_has_schedule_table(blocks):
+        blocks.append(
+            {
+                "kind": "table",
+                "caption": "Emploi du temps",
+                "headers": ["Jour", "Horaire", "Matière", "Enseignant", "Salle", "Semaine"],
+                "rows": _schedule_rows(schedules),
+            }
+        )
+    spec["blocks"] = blocks
+
+    document = Document()
+    applied: list[str] = []
+    warnings: list[str] = []
+    _render_design_spec(document, spec, applied, warnings)
+
+    title = str(new_doc.get("title") or "").strip() or str(subject or "Document").strip()
+    for block in blocks:
+        kind = str(block.get("kind") or "").strip()
+        if kind == "title_block":
+            value = str(block.get("title") or "").strip()
+            if value:
+                title = value
+                break
+        elif kind == "heading":
+            value = str(block.get("text") or block.get("title") or "").strip()
+            if value:
+                title = value
+                break
     document.core_properties.title = title
 
     return {
@@ -1581,14 +2126,25 @@ def execute_word_decision(
 
     ``use_blueprint`` keeps the selected template with only an optional date
     edit. ``modify_blueprint`` applies the planner's targeted edits on a copy.
-    ``create_new`` builds a clean document from the enriched ``new_doc`` schema.
+    ``create_new`` builds a clean document from ``design_spec`` (falling back
+    to the legacy ``new_doc`` structure when no design is supplied).
     """
     data = _as_dict(decision)
     action = str(data.get("action") or "create_new").strip()
     blueprint_id = data.get("blueprint_id")
     new_doc = _as_dict(data.get("new_doc")) if data.get("new_doc") else None
+    design_spec = (
+        _as_dict(data.get("design_spec")) if data.get("design_spec") else None
+    )
+    design_title = ""
+    for raw_block in (design_spec or {}).get("blocks") or []:
+        block = _as_dict(raw_block)
+        if str(block.get("kind") or "") == "title_block":
+            design_title = str(block.get("title") or "").strip()
+            if design_title:
+                break
     title = str(
-        (new_doc or {}).get("title") or data.get("title") or ""
+        (new_doc or {}).get("title") or design_title or data.get("title") or ""
     ).strip()
 
     plan = {
@@ -1599,6 +2155,7 @@ def execute_word_decision(
         "edits": [_as_dict(edit) for edit in data.get("edits") or []],
         "sections": [_as_dict(section) for section in data.get("sections") or []],
         "new_doc": new_doc,
+        "design_spec": design_spec,
     }
 
     if action in {"use_blueprint", "modify_blueprint"}:
