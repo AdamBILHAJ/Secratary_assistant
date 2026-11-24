@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "IT Department Automation API"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 STARTED_AT = time.time()
 
 CORS_ORIGINS = [
@@ -90,6 +90,14 @@ app.include_router(schedules.router, prefix="/api/schedules")
 app.include_router(classrooms.router, prefix="/api/classrooms")
 app.include_router(documents.router, prefix="/api/documents")
 
+# Singular compatibility alias for clients using the documented example path.
+app.add_api_route(
+    "/api/schedule/ask",
+    schedules.ask_schedule,
+    methods=["POST"],
+    include_in_schema=False,
+)
+
 
 @app.get("/", include_in_schema=False)
 async def root() -> dict[str, str]:
@@ -98,6 +106,7 @@ async def root() -> dict[str, str]:
         "docs": "/docs",
         "health": "/api/health",
         "schedules_debug": "/api/schedules/debug-parse",
+        "schedule_ask": "/api/schedules/ask",
         "classroom_check": "/api/classrooms/check",
         "document_blueprints": "/api/documents/blueprints",
         "document_generate": "/api/documents/generate",

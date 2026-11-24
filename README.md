@@ -329,6 +329,44 @@ the PDF text order:
 - returns warnings per page instead of failing the whole document when one page
   is malformed; a completely unparseable PDF returns `422`.
 
+### 2.4 Unified room & schedule Q&A
+
+One prompt can now handle all schedule questions through
+`POST /api/schedules/ask` (also available as `/api/schedule/ask`):
+
+```bash
+curl -X POST http://localhost:8000/api/schedules/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Is room C9 free on Monday at 10h15-11h45?"}'
+```
+
+Gemini returns a structured `ScheduleQueryDecision` with one of three actions:
+
+| Action | Meaning |
+| --- | --- |
+| `check_room_availability` | Is a specific room free or occupied? Requires `room`. |
+| `find_available_rooms` | Which rooms are free for the requested day/time/badge? |
+| `query_schedule` | General questions about classes, teachers, subjects, rooms, days and times. |
+
+Extracted filters are `room`, `day`, `date`, `time_slot`, `week_badge`, `group`,
+`class_name`, `teacher`, `subject` and `confidence`. The router uses the same
+`GEMINI_MODEL` rotation, 30-second attempt timeout and 75-second total budget
+as Word generation. Low confidence (`< 0.6`), missing API keys, timeouts or
+invalid responses switch to deterministic parsing. A `check_room_availability`
+decision without a room is coerced to `find_available_rooms` when a
+day/time/badge filter exists, otherwise to `query_schedule`.
+
+`Q1`/`Q2` are treated as alternating-week badges (`G1`/`G2` groups), never
+physical rooms. The active week is derived from `date` using the existing anchor
+`week_start = 2026-09-07` (or the most recent stored timetable week start). All
+Mongo queries are read-only and restricted to allowlisted schedule fields with
+escaped values.
+
+The JSON response contains the resolved `action`/`filters`, a natural-language
+`answer` in the prompt's language, `available`, `conflicts`, `available_rooms`
+when relevant, and `matching_sessions` with the underlying timetable records.
+The dashboard exposes this through a single **Room & Schedule Assistant** prompt.
+
 ## 3. Word document generation
 
 Part 3 adds Word-only document automation. Excel generation is intentionally

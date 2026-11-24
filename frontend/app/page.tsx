@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 
 import { API_URL, type HealthResponse } from "@/lib/api";
 
+import ScheduleAssistant from "./schedule-assistant";
 import WordAssistant from "./word-assistant";
 
 function formatUptime(seconds: number) {
@@ -303,6 +304,7 @@ export default function Home() {
           </Card>
         </div>
 
+        <ScheduleAssistant />
         <WordAssistant />
 
         <section className="mt-10 rounded-2xl border border-white/10 bg-white/[0.02] p-5">

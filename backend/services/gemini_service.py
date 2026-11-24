@@ -37,6 +37,7 @@ DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_TOTAL_BUDGET_SECONDS = 75.0
 BLUEPRINT_CONFIDENCE_THRESHOLD = 0.7
+SCHEDULE_CONFIDENCE_THRESHOLD = 0.6
 DEFAULT_FALLBACK_MODELS: tuple[str, ...] = (
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
@@ -57,6 +58,33 @@ class AIAdvice(BaseModel):
     recommendation: str = Field(description="1-2 sentence recommendation for the secretary")
     recommended_room: str | None = Field(
         default=None, description="One room from the available_rooms list, or null"
+    )
+
+
+class ScheduleQueryDecision(BaseModel):
+    """Structured query plan for the unified schedule Q&A endpoint."""
+
+    action: Literal[
+        "check_room_availability",
+        "find_available_rooms",
+        "query_schedule",
+    ] = Field(description="Which deterministic schedule query to run.")
+    room: str | None = Field(
+        default=None, description="Physical room code. Q1/Q2 are not rooms."
+    )
+    day: str | None = Field(default=None, description="Normalized weekday name.")
+    date: str | None = Field(default=None, description="ISO date, when supplied.")
+    time_slot: str | None = Field(default=None, description="Canonical time range.")
+    week_badge: str | None = Field(default=None, description="Q1 or Q2 badge.")
+    group: str | None = Field(default=None, description="Derived G1 or G2 group.")
+    class_name: str | None = Field(default=None, description="Optional class filter.")
+    teacher: str | None = Field(default=None, description="Optional teacher filter.")
+    subject: str | None = Field(default=None, description="Optional subject filter.")
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Router confidence; low values fall back to deterministic parsing.",
     )
 
 

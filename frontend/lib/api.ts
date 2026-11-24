@@ -125,6 +125,76 @@ export async function fetchBlueprints(
   return (await response.json()) as BlueprintListResponse;
 }
 
+export type ScheduleAction =
+  | "check_room_availability"
+  | "find_available_rooms"
+  | "query_schedule";
+
+export type ScheduleFilters = {
+  room?: string | null;
+  day?: string | null;
+  date?: string | null;
+  time_slot?: string | null;
+  week_badge?: string | null;
+  group?: string | null;
+  class_name?: string | null;
+  teacher?: string | null;
+  subject?: string | null;
+  confidence?: number;
+  slots?: string[];
+  active_week?: string | null;
+  week_start?: string | null;
+  effective_day?: string | null;
+};
+
+export type ScheduleSession = {
+  entry_key?: string;
+  class_name?: string;
+  day?: string;
+  time_slot?: string;
+  start_time?: string;
+  end_time?: string;
+  slots?: string[];
+  subject?: string;
+  teacher?: string | null;
+  room?: string | null;
+  week?: string | null;
+  group?: string | null;
+  [key: string]: unknown;
+};
+
+export type ScheduleAskResponse = {
+  action: ScheduleAction;
+  prompt: string;
+  filters: ScheduleFilters;
+  answer: string;
+  available: boolean | null;
+  conflicts: ScheduleSession[];
+  available_rooms: string[];
+  matching_sessions: ScheduleSession[];
+  source: string;
+  model: string;
+  routing_error?: string | null;
+  routing_note?: string | null;
+};
+
+export async function askSchedule(
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<ScheduleAskResponse> {
+  const response = await fetch(`${API_URL}/api/schedules/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+  return (await response.json()) as ScheduleAskResponse;
+}
+
 export async function generateWordDocument(
   input: GenerateWordInput,
   signal?: AbortSignal,

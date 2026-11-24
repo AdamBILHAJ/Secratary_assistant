@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import time
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any
 
@@ -15,6 +19,210 @@ from database import get_collection
 logger = logging.getLogger(__name__)
 
 SCHEDULES_COLLECTION = "schedules"
+
+# Optional JSON object of extra aliases, e.g.
+# ``{"bd": ["BD", "Base de Données"], "l2 rsi": ["L2-RSI", "L2 RSI 2"]}``.
+SCHEDULE_ALIASES_ENV = "SCHEDULE_ALIASES_JSON"
+SCHEDULE_VOCAB_TTL_ENV = "SCHEDULE_VOCAB_TTL_SECONDS"
+
+# Each group is an allowlist: only these stored fields may be queried for the
+# corresponding router filter. Nothing outside this list reaches MongoDB.
+CLASS_FIELDS = (
+    "class_name",
+    "class",
+    "level",
+    "group",
+    "group_name",
+    "track",
+    "specialty",
+    "section",
+)
+SUBJECT_FIELDS = (
+    "subject",
+    "module",
+    "module_name",
+    "title",
+    "course",
+    "course_name",
+    "ue",
+    "matiere",
+)
+TEACHER_FIELDS = ("teacher", "professor", "instructor", "enseignant")
+ROOM_FIELDS = ("room", "salle", "classroom")
+DAY_FIELDS = ("day", "jour")
+WEEK_FIELDS = ("week", "group", "badge")
+
+VOCABULARY_FIELDS: dict[str, tuple[str, ...]] = {
+    "class_name": CLASS_FIELDS,
+    "subject": SUBJECT_FIELDS,
+    "teacher": TEACHER_FIELDS,
+    "room": ROOM_FIELDS,
+    "week": WEEK_FIELDS,
+}
+
+_BASE_ALIASES: dict[str, tuple[str, ...]] = {
+    "bd": ("BD", "BDD", "DB", "SGBD", "Base de Données", "Database"),
+    "bdd": ("BD", "BDD", "DB", "SGBD", "Base de Données", "Database"),
+    "db": ("BD", "BDD", "DB", "SGBD", "Base de Données", "Database"),
+    "sgbd": ("BD", "BDD", "DB", "SGBD", "Base de Données", "Database"),
+    "base de donnees": ("BD", "BDD", "DB", "SGBD", "Base de Données", "Database"),
+    "database": ("BD", "BDD", "DB", "SGBD", "Base de Données", "Database"),
+    "rsi": ("RSI", "L2 RSI", "L2 RSI 2", "L2-RSI", "L2-RSI-2", "L2RSI2"),
+    "l2 rsi": ("L2-RSI", "L2 RSI", "L2 RSI 2", "L2-RSI-2", "L2RSI2"),
+    "l2 rsi 2": ("L2-RSI", "L2 RSI", "L2 RSI 2", "L2-RSI-2", "L2RSI2"),
+    "l2-rsi": ("L2-RSI", "L2 RSI", "L2 RSI 2", "L2-RSI-2", "L2RSI2"),
+    "l2_rsi_2": ("L2-RSI", "L2 RSI", "L2 RSI 2", "L2-RSI-2", "L2RSI2"),
+}
+
+_SEPARATOR_RE = re.compile(r"[\s\-_/\\.]+")
+_ACCENT_EQUIVALENTS = {
+    "a": "aàáâäãå",
+    "c": "cç",
+    "e": "eèéêë",
+    "i": "iìíîï",
+    "n": "nñ",
+    "o": "oòóôöõ",
+    "u": "uùúûü",
+    "y": "yÿ",
+}
+
+_vocabulary_cache: dict[str, Any] = {"value": None, "expires_at": 0.0}
+
+
+def normalize_compare(value: Any) -> str:
+    """Lowercase, strip accents and unify separators for tolerant comparison."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(char for char in text if not unicodedata.combining(char)).lower()
+    return re.sub(r"\s+", " ", _SEPARATOR_RE.sub(" ", text)).strip()
+
+
+def alias_dictionary() -> dict[str, tuple[str, ...]]:
+    """Return built-in aliases merged with optional JSON configuration."""
+    aliases = {
+        normalize_compare(key): tuple(values)
+        for key, values in _BASE_ALIASES.items()
+    }
+    raw = os.getenv(SCHEDULE_ALIASES_ENV, "").strip()
+    if not raw:
+        return aliases
+    try:
+        configured = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("Ignoring invalid %s: %s", SCHEDULE_ALIASES_ENV, exc)
+        return aliases
+    if not isinstance(configured, dict):
+        logger.warning("%s must be a JSON object", SCHEDULE_ALIASES_ENV)
+        return aliases
+
+    for key, values in configured.items():
+        if isinstance(values, str):
+            extra = (values,)
+        elif isinstance(values, (list, tuple)):
+            extra = tuple(str(value) for value in values)
+        else:
+            continue
+        normalized_key = normalize_compare(key)
+        if normalized_key:
+            aliases[normalized_key] = tuple(
+                dict.fromkeys([*aliases.get(normalized_key, ()), *extra])
+            )
+    return aliases
+
+
+def expand_aliases(value: Any) -> list[str]:
+    """Return the normalized value plus any alias/token expansions."""
+    normalized = normalize_compare(value)
+    if not normalized:
+        return []
+    aliases = alias_dictionary()
+    variants = [normalized]
+    variants.extend(
+        normalize_compare(alias) for alias in aliases.get(normalized, ())
+    )
+
+    tokens = normalized.split()
+    for index, token in enumerate(tokens):
+        for alias in aliases.get(token, ()):
+            expanded = tokens[:index] + normalize_compare(alias).split() + tokens[index + 1 :]
+            variants.append(" ".join(expanded))
+    return list(dict.fromkeys(variant for variant in variants if variant))
+
+
+def _letter_pattern(char: str) -> str:
+    alternatives = _ACCENT_EQUIVALENTS.get(char.lower(), char.lower())
+    return f"[{re.escape(alternatives)}]"
+
+
+def normalized_value_regex(value: Any, *, anchored: bool = False) -> str:
+    """Build an accent/separator tolerant regex for a router filter value."""
+    variants = expand_aliases(value)
+    if not variants:
+        return re.escape(normalize_compare(value))
+
+    separator = r"[\s\-_/]+"
+    patterns: list[str] = []
+    for variant in variants:
+        tokens = variant.split()
+        if not tokens:
+            continue
+        body = separator.join(
+            "".join(
+                _letter_pattern(char) if char.isalpha() else re.escape(char)
+                for char in token
+            )
+            for token in tokens
+        )
+        patterns.append(rf"^{body}(?:$|{separator})" if anchored else body)
+    return "(?:" + "|".join(patterns or [re.escape(variants[0])]) + ")"
+
+
+def _multi_field_filter(fields: tuple[str, ...], value: Any, *, anchored: bool) -> dict[str, Any]:
+    pattern = normalized_value_regex(value, anchored=anchored)
+    return {
+        "$or": [
+            {field: {"$regex": pattern, "$options": "i"}}
+            for field in fields
+            if field
+        ]
+    }
+
+
+def _build_schedule_query(
+    *,
+    day: str | None = None,
+    slots: list[str] | None = None,
+    week: str | None = None,
+    room: str | None = None,
+    class_name: str | None = None,
+    teacher: str | None = None,
+    subject: str | None = None,
+) -> dict[str, Any]:
+    """Build a read-only query using only allowlisted schedule fields."""
+    conditions: list[dict[str, Any]] = []
+    if day:
+        conditions.append(_multi_field_filter(DAY_FIELDS, day, anchored=True))
+    if slots:
+        conditions.append(
+            {"slots": {"$in": [str(slot) for slot in slots if str(slot).strip()]}}
+        )
+    if week:
+        conditions.append(
+            {"$or": [{"week": week}, {"week": None}, {"week": {"$exists": False}}]}
+        )
+    if room:
+        conditions.append(_multi_field_filter(ROOM_FIELDS, room, anchored=True))
+    if class_name:
+        conditions.append(_multi_field_filter(CLASS_FIELDS, class_name, anchored=True))
+    if teacher:
+        conditions.append(_multi_field_filter(TEACHER_FIELDS, teacher, anchored=False))
+    if subject:
+        conditions.append(_multi_field_filter(SUBJECT_FIELDS, subject, anchored=False))
+
+    if not conditions:
+        return {}
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
 
 
 class ScheduleStoreError(RuntimeError):
@@ -165,6 +373,108 @@ async def fetch_class_schedules(
         )
     )
     return documents
+
+
+async def query_schedule_entries(
+    *,
+    day: str | None = None,
+    slots: list[str] | None = None,
+    week: str | None = None,
+    room: str | None = None,
+    class_name: str | None = None,
+    teacher: str | None = None,
+    subject: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Run a read-only, allowlisted filter query against stored schedules.
+
+    Only known schedule fields are queryable and every text value is regex
+    escaped, so free-form router output cannot inject MongoDB operators.
+    """
+    query = _build_schedule_query(
+        day=day,
+        slots=slots,
+        week=week,
+        room=room,
+        class_name=class_name,
+        teacher=teacher,
+        subject=subject,
+    )
+
+    safe_limit = min(max(int(limit or 500), 1), 1000)
+    try:
+        cursor = (
+            get_collection(SCHEDULES_COLLECTION)
+            .find(query, {"_id": 0, "imported_at": 0})
+            .limit(safe_limit)
+        )
+        documents = await cursor.to_list(length=safe_limit)
+    except (PyMongoError, RuntimeError) as exc:
+        raise ScheduleStoreError(f"MongoDB schedule query failed: {exc}") from exc
+
+    documents.sort(
+        key=lambda item: (
+            str(item.get("day") or ""),
+            str(item.get("start_time") or item.get("time_slot") or ""),
+            str(item.get("room") or ""),
+            str(item.get("subject") or ""),
+        )
+    )
+    return documents
+
+
+async def fetch_schedule_vocabulary(
+    *,
+    force_refresh: bool = False,
+    max_values: int = 40,
+) -> dict[str, list[str]]:
+    """Return cached distinct classes/subjects/teachers/rooms/badges.
+
+    Vocabulary is used only to make routing more accurate. Failures never
+    break schedule queries: an empty summary simply means Gemini and the
+    deterministic fallbacks rely on alias expansion instead.
+    """
+    global _vocabulary_cache
+
+    try:
+        ttl = float(os.getenv(SCHEDULE_VOCAB_TTL_ENV, "300"))
+    except (TypeError, ValueError):
+        ttl = 300.0
+    ttl = min(max(ttl, 0.0), 3600.0)
+
+    now = time.monotonic()
+    cached = _vocabulary_cache.get("value")
+    if (
+        not force_refresh
+        and isinstance(cached, dict)
+        and now < float(_vocabulary_cache.get("expires_at", 0.0))
+    ):
+        return {key: list(values) for key, values in cached.items()}
+
+    values_by_key: dict[str, list[str]] = {}
+    try:
+        collection = get_collection(SCHEDULES_COLLECTION)
+        for key, fields in VOCABULARY_FIELDS.items():
+            found: list[str] = []
+            for field in fields:
+                try:
+                    raw_values = await collection.distinct(field)
+                except (PyMongoError, RuntimeError) as exc:
+                    logger.debug("Could not read distinct %s: %s", field, exc)
+                    continue
+                for value in raw_values or []:
+                    text = str(value).strip()
+                    if text:
+                        found.append(text)
+            values_by_key[key] = sorted(
+                dict.fromkeys(found), key=lambda item: normalize_compare(item)
+            )[:max_values]
+    except (PyMongoError, RuntimeError) as exc:
+        logger.warning("Could not load schedule vocabulary: %s", exc)
+        return {}
+
+    _vocabulary_cache = {"value": values_by_key, "expires_at": now + ttl}
+    return {key: list(values) for key, values in values_by_key.items()}
 
 
 async def get_week_start() -> str | None:
